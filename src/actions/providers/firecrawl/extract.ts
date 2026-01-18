@@ -44,15 +44,14 @@ const extract: firecrawlExtractFunction = async ({
     ignoreInvalidURLs,
     timeLimit,
   } = params;
-  const { apiKey } = authParams;
 
+  const { apiKey } = authParams;
   if (!apiKey) {
     throw new Error("Missing Firecrawl API key");
   }
 
   const headers = { Authorization: `Bearer ${apiKey}` };
 
-  // Build request body, only including defined parameters
   const requestBody: Record<string, unknown> = { urls };
   if (prompt !== undefined) requestBody.prompt = prompt;
   if (schema !== undefined) requestBody.schema = schema;
@@ -63,7 +62,6 @@ const extract: firecrawlExtractFunction = async ({
   if (scrapeOptions !== undefined) requestBody.scrapeOptions = scrapeOptions;
   if (ignoreInvalidURLs !== undefined) requestBody.ignoreInvalidURLs = ignoreInvalidURLs;
 
-  // 1) Start the extraction job
   const startResponse = await axiosClient.post<FirecrawlExtractStartResponse>(
     "https://api.firecrawl.dev/v2/extract",
     requestBody,
@@ -78,12 +76,11 @@ const extract: firecrawlExtractFunction = async ({
 
   const extractionId = startResponse.data.id;
 
-  // 2) Poll until completion (with timeout + exponential backoff)
   const pollUrl = `https://api.firecrawl.dev/v2/extract/${extractionId}`;
-  let intervalMs = 1000; // Start at 1 second
-  const maxIntervalMs = 5000; // Cap at 5 seconds
+  let intervalMs = 1000;
+  const maxIntervalMs = 5000;
   const effectiveTimeLimit = typeof timeLimit === "number" && timeLimit > 0 ? timeLimit : 120;
-  const maxWaitMs = effectiveTimeLimit * 1000 + 15_000; // timeLimit + 15s buffer
+  const maxWaitMs = effectiveTimeLimit * 1000 + 15_000;
   const deadline = Date.now() + maxWaitMs;
 
   while (true) {
@@ -91,7 +88,6 @@ const extract: firecrawlExtractFunction = async ({
     const data = pollResponse.data;
 
     if (!data?.status) {
-      // Transient bad payload - retry until deadline
       if (Date.now() > deadline) {
         throw new Error("Extract polling timed out (no status received).");
       }
@@ -101,7 +97,6 @@ const extract: firecrawlExtractFunction = async ({
     }
 
     if (data.status === "completed") {
-      // Validate and return
       return firecrawlExtractOutputSchema.parse({
         success: true,
         data: data.data ?? {},
@@ -116,10 +111,10 @@ const extract: firecrawlExtractFunction = async ({
       );
     }
 
-    // Status is "processing" - continue polling
     if (Date.now() > deadline) {
       throw new Error("Extract polling timed out.");
     }
+
     await sleep(intervalMs);
     intervalMs = Math.min(Math.floor(intervalMs * 1.5), maxIntervalMs);
   }
