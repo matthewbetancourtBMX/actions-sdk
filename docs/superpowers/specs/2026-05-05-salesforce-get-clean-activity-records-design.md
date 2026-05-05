@@ -3,6 +3,7 @@
 **Date:** 2026-05-05
 **Repo:** actions-sdk (fork of credal-ai/actions-sdk)
 **Status:** Approved for implementation
+**Field reference:** `bmx-ipm-repo/docs/salesforce-query-reference-v3/reference/activity-object-field-reference.md`
 
 ---
 
@@ -74,13 +75,16 @@ SOQL constraints respected throughout:
 
 ### Phase 2 — EmailMessage
 
-1. **Probe** — `COUNT(Id)` scoped to `RelatedToId IN (whatId)`. If zero, note it and skip to Task phase. Emit explicit zero note in output.
-2. **Index fetch** — Retrieve: `Id`, `ActivityId`, `MessageIdentifier`, `ThreadIdentifier`, `Subject`, `MessageDate`, `Incoming`, `FromAddress`, `ToAddress`, `CcAddress`. Do **not** fetch `TextBody` yet.
-3. **Client-side deduplication** — Deduplicate on `MessageIdentifier`. Group by `ThreadIdentifier`. For each thread: record subject, message count, most recent `MessageDate`, direction of most recent message, and collect the `Id` of the most recent message.
-4. **ActivityId exclusion set** — Collect all `ActivityId` values from all returned EmailMessage records. This set is passed to Phase 3 to exclude mirror Tasks.
-5. **Thread selection** — Prioritize by recency. Exclude auto-generated subjects (shipping confirmations, system notifications, case auto-replies identified by `Auto-Submitted` header or known noreply patterns).
-6. **TextBody fetch** — For selected threads only: `WHERE Id IN (<most recent Id per thread>)`. One fetch per thread maximum. Never filter by `ThreadIdentifier`.
-7. **Address surface** — Collect all `FromAddress`, `ToAddress`, `CcAddress` across fetched messages for contact reconciliation.
+1. **Probe** — `COUNT(Id)` scoped to `RelatedToId = <whatId>`. If zero, note it and skip to Task phase. Emit explicit zero note in output.
+2. **Index fetch** — Retrieve: `Id`, `ActivityId`, `MessageIdentifier`, `ThreadIdentifier`, `Subject`, `MessageDate`, `Incoming`, `FromAddress`, `FromName`, `ToAddress`, `CcAddress`. Do **not** fetch `TextBody` yet.
+3. **Client-side deduplication** — Deduplicate on `MessageIdentifier`. Group by `ThreadIdentifier`. For each thread: record subject, message count, most recent `MessageDate`, direction (`Incoming` field on most recent message), and collect the `Id` of the most recent message.
+4. **ActivityId exclusion set** — Collect all non-null `ActivityId` values from all returned EmailMessage records. This set is passed to Phase 3 to exclude mirror Tasks.
+5. **Thread selection** — Prioritize by recency. Exclude auto-generated subjects (shipping confirmations, system notifications, case auto-replies — identifiable by `CreatedBy.Username` matching `automatedcase@*` pattern or `Auto-Submitted` in `Headers`).
+6. **TextBody fetch** — For selected threads only: `WHERE Id IN (<most recent Id per thread>)`. One message per thread. Never filter by `ThreadIdentifier`.
+7. **Participant resolution** — For each fetched message, collect participants from two sources:
+   - **Raw address fields** on the EmailMessage record: `FromAddress`, `ToAddress` (semicolon-delimited), `CcAddress`, `BccAddress` — these are non-CRM addresses
+   - **EmailMessageRelation** child records: query `SELECT RelationId, RelationType, Relation.Name, Relation.Email FROM EmailMessageRelation WHERE EmailMessageId IN (...)` — these are CRM-linked Contacts, Leads, and Users
+   - Merge both sets, deduplicate on email address. `RelationId` may be null in some configurations; fall back to raw address fields in that case.
 
 ---
 
@@ -92,15 +96,20 @@ SOQL constraints respected throughout:
 4. **Split by TaskSubtype:**
 
    **`TaskSubtype = 'Email'` (logged email tasks):**
-   - Normalize Subject: strip leading `Email:`, `>>`, `Re:`, `Fwd:`, `FW:` prefixes (case-insensitive, repeated)
-   - Group remaining tasks by normalized Subject + `WhoId` + `WhatId`
+   - **Direction detection:** Check Subject prefix before normalization:
+     - `Email: >> ...` → `outbound`
+     - `Email: << ...` → `inbound`
+     - No `>>` / `<<` → `unknown`
+   - **Normalize Subject** for thread clustering: strip `Email:`, `>>`, `<<`, `Re:`, `Fwd:`, `FW:` (case-insensitive, applied repeatedly), trim whitespace
+   - Group by normalized Subject + `WhoId` + `WhatId`
    - For each cluster: identify the most recent record by `groove_email_sent_at__c` (fallback: `LastModifiedDate`)
    - Fetch `Description` only for the most recent Task per cluster
    - **Description cleaning:** Extract only the content before the first quoted-reply marker. Strip:
-     - Header block (`From:`, `To:`, `CC:`, `BCC:`, `Attachment:` lines at top)
-     - Everything from the first `On <date> <name> wrote:` line onward
-     - Trailing signature blocks (heuristic: lines after repeated `\r\n` containing phone/address/social link patterns)
-   - Return: cluster subject, owner, cleaned latest message body, sent timestamp, `WhoId`, `WhatId`, cluster size (how many emails in thread)
+     - Header block (`From:`, `To:`, `CC:`, `BCC:`, `Attachment:` lines at top of Description)
+     - Everything from the first `On <date> <name> wrote:` line onward (handles both `\n` and `\r\n` mixed line endings)
+     - Trailing signature blocks (heuristic: lines after repeated blank lines containing phone/address/social link patterns)
+   - **Related contacts:** Collect `WhoId` as primary contact. If `TaskWhoIds` is available (Shared Activities enabled), also collect all IDs from `TaskWhoRelations` subquery
+   - Return: canonical subject, direction of most recent message, owner, cleaned body, sent timestamp, `WhoId`, `WhatId`, cluster size
 
    **All other `TaskSubtype` values (null, Call, Meeting, etc.):**
    - These are deliberate human activity records — always fetch `Description` in full
@@ -138,18 +147,24 @@ SOQL constraints respected throughout:
     subject: string;
     messageCount: number;
     mostRecentDate: string;
-    direction: 'inbound' | 'outbound'; // direction of most recent message
+    direction: 'inbound' | 'outbound'; // Incoming field on most recent message
     latestMessageId: string;
-    body: string; // TextBody of most recent message only
-    participants: { from: string; to: string; cc?: string };
+    body: string; // TextBody of most recent message only — no quoted history
+    participants: {
+      from: { address: string; name?: string; relationId?: string };
+      to: Array<{ address: string; name?: string; relationId?: string }>;
+      cc: Array<{ address: string; name?: string; relationId?: string }>;
+    };
   }>;
 
   emailTaskClusters: Array<{
     normalizedSubject: string;
-    clusterSize: number; // total Tasks in this thread
+    clusterSize: number; // total Tasks in this thread cluster
     mostRecentDate: string;
+    direction: 'inbound' | 'outbound' | 'unknown'; // from Subject >> / << prefix
     owner: string;
-    whoId?: string;
+    whoId?: string;         // primary contact ID
+    relatedContactIds: string[]; // all contact IDs from TaskWhoRelations
     whatId?: string;
     cleanedBody: string; // Description stripped of headers, quoted content, signatures
   }>;
