@@ -258,7 +258,7 @@ async function handleTask(
   const exclusionIds = parseExcludeActivityIds(excludeActivityIds);
   const exclusion = exclusionIds.length > 0 ? ` AND Id NOT IN (${exclusionIds.map(id => `'${id}'`).join(",")})` : "";
   // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
-  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY LastModifiedDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email' AND Status = 'Completed'${exclusion} ORDER BY LastModifiedDate DESC NULLS LAST LIMIT ${limit + 1}`;
   const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
   const hasMore = rawRecords.length > limit;
   const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;

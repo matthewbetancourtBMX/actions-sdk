@@ -127,6 +127,33 @@ describe("salesforceGetCleanActivityRecords EmailMessage exclusions", () => {
   });
 });
 
+describe("salesforceGetCleanActivityRecords Task filters", () => {
+  test("only queries completed email Tasks", async () => {
+    mockGet.mockResolvedValueOnce({
+      data: {
+        records: [],
+        done: true,
+      },
+    });
+
+    await getCleanActivityRecords({
+      params: {
+        objectType: "Task",
+        whereClause: "WhatId = 'a3bQp000001h4J7IAI'",
+      },
+      authParams: {
+        authToken: "token",
+        baseUrl: "https://example.my.salesforce.com",
+      },
+    });
+
+    const requestUrl = String(mockGet.mock.calls[0]?.[0]);
+    const soql = decodeURIComponent(new URL(requestUrl).searchParams.get("q") ?? "");
+    expect(soql).toContain("TaskSubtype = 'Email'");
+    expect(soql).toContain("Status = 'Completed'");
+  });
+});
+
 describe("salesforceGetCleanActivityRecords input guards", () => {
   test("allows disallowed SOQL guard sequences inside quoted string literals", () => {
     expect(() =>
