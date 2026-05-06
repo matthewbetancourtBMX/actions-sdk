@@ -8,11 +8,15 @@ import {
   soqlQuery,
   validateWhereClause,
 } from "./getCleanActivityRecords.js";
+import getCleanActivityRecords from "./getCleanActivityRecords.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const mockGet = jest.fn<(...args: any[]) => Promise<any>>();
 
 jest.mock("../../util/axiosClient.js", () => ({
+  ApiError: class ApiError extends Error {
+    data?: unknown;
+  },
   axiosClient: { get: (...args: any[]) => mockGet(...args) },
 }));
 
@@ -46,6 +50,26 @@ describe("salesforceGetCleanActivityRecords Task email chronology", () => {
 });
 
 describe("salesforceGetCleanActivityRecords EmailMessage exclusions", () => {
+  test("rejects excludeActivityIds on EmailMessage instead of silently ignoring it", async () => {
+    await expect(
+      getCleanActivityRecords({
+        params: {
+          objectType: "EmailMessage",
+          whereClause: "RelatedToId = '500Qp0000012345AAA'",
+          excludeActivityIds: JSON.stringify(["00T000000000001AAA"]),
+        },
+        authParams: {
+          authToken: "token",
+          baseUrl: "https://example.my.salesforce.com",
+        },
+      }),
+    ).resolves.toMatchObject({
+      success: false,
+      error: "excludeActivityIds is only supported when objectType is Task",
+    });
+    expect(mockGet).not.toHaveBeenCalled();
+  });
+
   test("builds a separate uncapped ActivityId query from the same EmailMessage filter", () => {
     const soql = buildEmailMessageActivityIdQuery("RelatedToId = '500Qp0000012345AAA'");
 

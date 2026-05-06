@@ -67,6 +67,20 @@ function hasBalancedParentheses(value: string): boolean {
   return balanced && depth === 0;
 }
 
+function hasDisallowedSoqlSequenceOutsideString(value: string): boolean {
+  let hasDisallowedSequence = false;
+
+  forEachSoqlCharacterOutsideString(value, (_, index) => {
+    if (SOQL_INJECTION_PATTERN.test(value.slice(index, index + 2))) {
+      hasDisallowedSequence = true;
+      return "stop";
+    }
+    return undefined;
+  });
+
+  return hasDisallowedSequence;
+}
+
 function normalizeLimit(limit: number | undefined): number {
   return Math.min(Math.max(1, Math.trunc(limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
 }
@@ -81,7 +95,7 @@ function cleanBody(text: string | null | undefined): string | null {
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
-    .replace(/ /g, " ")
+    .replace(/&nbsp;/g, " ")
     .replace(/&#?\w+;/g, "");
   s = s.replace(/^(From|To|CC|BCC|Date|Subject|Attachment):.*\n/gim, "");
   const qm = s.match(/(?:^|\n)(On [\s\S]{0,250}?wrote:\s*(?:\n|$))/);
@@ -118,6 +132,9 @@ function parseSalesforceTimestamp(value: unknown): number {
 
 function getTaskEmailSortKey(record: SfRecord): number {
   const candidates = [
+    record.groove_email_sent_at__c,
+    record.Email_Sent_At__c,
+    record.EmailDate__c,
     record.LastModifiedDate,
     record.CreatedDate,
     record.ActivityDate,
@@ -139,6 +156,9 @@ function compareTaskEmailRecords(a: SfRecord, b: SfRecord): number {
 
 function formatTaskEmailDate(record: SfRecord): string | null {
   const candidates = [
+    record.groove_email_sent_at__c,
+    record.Email_Sent_At__c,
+    record.EmailDate__c,
     record.LastModifiedDate,
     record.CreatedDate,
     record.ActivityDate,
@@ -189,23 +209,23 @@ function parseExcludeActivityIds(excludeActivityIds?: string): string[] {
 // allow unintended record access. Hallucinated or malformed SOQL that passes this check returns a
 // Salesforce API error surfaced to the caller.
 function validateWhereClause(whereClause: string): void {
-  if (SOQL_INJECTION_PATTERN.test(whereClause)) {
+  if (hasDisallowedSoqlSequenceOutsideString(whereClause)) {
     throw new Error(
       "whereClause contains disallowed patterns (; -- /* */). Provide a plain SOQL filter expression without statement terminators or comment sequences. " +
-      "Example: \"WhatId = '001Qp000003abcDEF' AND ActivityDate >= 2024-01-01\"",
+        "Example: \"WhatId = '001Qp000003abcDEF' AND ActivityDate >= 2024-01-01\"",
     );
   }
   if (!hasBalancedParentheses(whereClause)) {
     throw new Error(
       "whereClause contains unbalanced parentheses. Provide a balanced SOQL filter expression that cannot escape appended safety filters. " +
-      "Example: \"(WhatId = '001Qp000003abcDEF' OR WhoId = '003Qp000003abcDEF') AND ActivityDate >= 2024-01-01\"",
+        "Example: \"(WhatId = '001Qp000003abcDEF' OR WhoId = '003Qp000003abcDEF') AND ActivityDate >= 2024-01-01\"",
     );
   }
 }
 
 // maxPages caps pagination for queries without a LIMIT clause (e.g. activity ID collection).
-// Queries with a LIMIT clause never produce more than one page, so the default 1 is safe for them.
-async function soqlQuery(baseUrl: string, authToken: string, soql: string, maxPages = 1): Promise<SfRecord[]> {
+// Queries with a LIMIT clause never produce more than one page, so the default Infinity is safe for them.
+async function soqlQuery(baseUrl: string, authToken: string, soql: string, maxPages = Infinity): Promise<SfRecord[]> {
   let url: string | null = `${baseUrl}/services/data/v56.0/query?q=${encodeURIComponent(soql)}`;
   const records: unknown[] = [];
   let pages = 0;
@@ -498,7 +518,7 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
   }
 
   if (objectType === "EmailMessage" && excludeActivityIds) {
-    return { success: false, error: "excludeActivityIds is only supported when objectType is 'Task'" };
+    return { success: false, error: "excludeActivityIds is only supported when objectType is Task" };
   }
 
   const effectiveLimit = normalizeLimit(limit);
