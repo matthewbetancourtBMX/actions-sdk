@@ -131,14 +131,7 @@ function parseSalesforceTimestamp(value: unknown): number {
 }
 
 function getTaskEmailSortKey(record: SfRecord): number {
-  const candidates = [
-    record.groove_email_sent_at__c,
-    record.Email_Sent_At__c,
-    record.EmailDate__c,
-    record.LastModifiedDate,
-    record.CreatedDate,
-    record.ActivityDate,
-  ];
+  const candidates = [record.ActivityDate, record.CompletedDateTime, record.LastModifiedDate, record.CreatedDate];
 
   for (const candidate of candidates) {
     const parsed = parseSalesforceTimestamp(candidate);
@@ -155,14 +148,7 @@ function compareTaskEmailRecords(a: SfRecord, b: SfRecord): number {
 }
 
 function formatTaskEmailDate(record: SfRecord): string | null {
-  const candidates = [
-    record.groove_email_sent_at__c,
-    record.Email_Sent_At__c,
-    record.EmailDate__c,
-    record.LastModifiedDate,
-    record.CreatedDate,
-    record.ActivityDate,
-  ];
+  const candidates = [record.ActivityDate, record.CompletedDateTime, record.LastModifiedDate, record.CreatedDate];
   return (candidates.find(value => typeof value === "string" && value.length > 0) as string | undefined) ?? null;
 }
 
@@ -258,7 +244,7 @@ async function handleTask(
   const exclusionIds = parseExcludeActivityIds(excludeActivityIds);
   const exclusion = exclusionIds.length > 0 ? ` AND Id NOT IN (${exclusionIds.map(id => `'${id}'`).join(",")})` : "";
   // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
-  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email' AND Status = 'Completed'${exclusion} ORDER BY LastModifiedDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CompletedDateTime, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email' AND Status = 'Completed'${exclusion} ORDER BY ActivityDate DESC NULLS LAST, CompletedDateTime DESC NULLS LAST LIMIT ${limit + 1}`;
   const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
   const hasMore = rawRecords.length > limit;
   const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;

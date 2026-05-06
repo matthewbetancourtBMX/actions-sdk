@@ -25,12 +25,11 @@ beforeEach(() => {
 });
 
 describe("salesforceGetCleanActivityRecords Task email chronology", () => {
-  test("orders email Task records by actual sent timestamp before manual sync timestamp", () => {
-    const oldEmailSyncedLater = {
+  test("orders email Task records by standard ActivityDate instead of custom fields or sync timestamps", () => {
+    const olderEmailSyncedLater = {
       Id: "00T000000000001AAA",
       Subject: "Email: >> Pricing follow-up",
-      ActivityDate: "2026-05-06",
-      groove_email_sent_at__c: "2026-04-01T09:00:00.000+0000",
+      ActivityDate: "2026-04-01",
       CreatedDate: "2026-05-06T14:00:00.000+0000",
       LastModifiedDate: "2026-05-06T14:00:00.000+0000",
     };
@@ -38,12 +37,11 @@ describe("salesforceGetCleanActivityRecords Task email chronology", () => {
       Id: "00T000000000002AAA",
       Subject: "Email: >> Pricing follow-up",
       ActivityDate: "2026-05-05",
-      groove_email_sent_at__c: "2026-05-05T15:30:00.000+0000",
       CreatedDate: "2026-05-05T16:00:00.000+0000",
       LastModifiedDate: "2026-05-05T16:00:00.000+0000",
     };
 
-    const sorted = [oldEmailSyncedLater, newerEmailSyncedEarlier].sort(compareTaskEmailRecords);
+    const sorted = [olderEmailSyncedLater, newerEmailSyncedEarlier].sort(compareTaskEmailRecords);
 
     expect(sorted[0]?.Id).toBe("00T000000000002AAA");
   });
@@ -151,6 +149,9 @@ describe("salesforceGetCleanActivityRecords Task filters", () => {
     const soql = decodeURIComponent(new URL(requestUrl).searchParams.get("q") ?? "");
     expect(soql).toContain("TaskSubtype = 'Email'");
     expect(soql).toContain("Status = 'Completed'");
+    expect(soql).toContain("CompletedDateTime");
+    expect(soql).toContain("ORDER BY ActivityDate DESC NULLS LAST, CompletedDateTime DESC NULLS LAST");
+    expect(soql).not.toContain("__c");
   });
 });
 
