@@ -17,6 +17,59 @@ const SOQL_INJECTION_PATTERN = /;|--|\/\*|\*\//;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type SfRecord = Record<string, any>;
 
+function forEachSoqlCharacterOutsideString(
+  value: string,
+  callback: (character: string, index: number) => void | "stop",
+): void {
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < value.length; i += 1) {
+    const character = value[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === "'" && value[i + 1] === "'") {
+        i += 1;
+      } else if (character === "'") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (character === "'") {
+      inString = true;
+      continue;
+    }
+
+    if (callback(character, i) === "stop") return;
+  }
+}
+
+function hasBalancedParentheses(value: string): boolean {
+  let depth = 0;
+  let balanced = true;
+
+  forEachSoqlCharacterOutsideString(value, character => {
+    if (character === "(") depth += 1;
+    if (character === ")") depth -= 1;
+    if (depth < 0) {
+      balanced = false;
+      return "stop";
+    }
+    return undefined;
+  });
+
+  return balanced && depth === 0;
+}
+
+function normalizeLimit(limit: number | undefined): number {
+  return Math.min(Math.max(1, Math.trunc(limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
+}
+
 function cleanBody(text: string | null | undefined): string | null {
   if (!text) return null;
   let s = text;
@@ -147,12 +200,31 @@ function validateWhereClause(whereClause: string): void {
         "Example: \"WhatId = '001Qp000003abcDEF' AND ActivityDate >= 2024-01-01\"",
     );
   }
+  if (!hasBalancedParentheses(whereClause)) {
+    throw new Error(
+      "whereClause contains unbalanced parentheses. Provide a balanced SOQL filter expression that cannot escape appended safety filters. " +
+        "Example: \"(WhatId = '001Qp000003abcDEF' OR WhoId = '003Qp000003abcDEF') AND ActivityDate >= 2024-01-01\"",
+    );
+  }
 }
 
 async function soqlQuery(baseUrl: string, authToken: string, soql: string): Promise<unknown[]> {
-  const url = `${baseUrl}/services/data/v56.0/query?q=${encodeURIComponent(soql)}`;
-  const response = await axiosClient.get(url, { headers: { Authorization: `Bearer ${authToken}` } });
-  return response.data.records ?? [];
+  let url: string | null = `${baseUrl}/services/data/v56.0/query?q=${encodeURIComponent(soql)}`;
+  const records: unknown[] = [];
+
+  while (url) {
+    const response: { data: { records?: unknown[]; done?: boolean; nextRecordsUrl?: string } } = await axiosClient.get(
+      url,
+      { headers: { Authorization: `Bearer ${authToken}` } },
+    );
+    records.push(...(response.data.records ?? []));
+    url =
+      response.data.done === false && typeof response.data.nextRecordsUrl === "string"
+        ? `${baseUrl}${response.data.nextRecordsUrl}`
+        : null;
+  }
+
+  return records;
 }
 
 async function handleTask(
@@ -246,14 +318,68 @@ function containsSemiJoinSubquery(whereClause: string): boolean {
   return /\b(?:NOT\s+)?IN\s*\(\s*SELECT\b/i.test(whereClause);
 }
 
+function findMatchingParen(value: string, openIndex: number): number | null {
+  let depth = 0;
+  let match: number | null = null;
+
+  forEachSoqlCharacterOutsideString(value, (character, index) => {
+    if (index < openIndex) return undefined;
+    if (character === "(") depth += 1;
+    if (character === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        match = index;
+        return "stop";
+      }
+    }
+    return undefined;
+  });
+
+  return match;
+}
+
+function findParenthesizedRanges(value: string): Array<{ start: number; end: number }> {
+  const stack: number[] = [];
+  const ranges: Array<{ start: number; end: number }> = [];
+
+  forEachSoqlCharacterOutsideString(value, (character, index) => {
+    if (character === "(") stack.push(index);
+    if (character === ")") {
+      const start = stack.pop();
+      if (start !== undefined) ranges.push({ start, end: index });
+    }
+    return undefined;
+  });
+
+  return ranges;
+}
+
+function isCompleteSemiJoinExpression(expression: string): boolean {
+  const trimmed = expression.trim();
+  const match = /^[A-Za-z_][\w.]*\s+(?:NOT\s+)?IN\s*\(/i.exec(trimmed);
+  if (!match) return false;
+
+  const openParenIndex = match[0].lastIndexOf("(");
+  return findMatchingParen(trimmed, openParenIndex) === trimmed.length - 1;
+}
+
 function unwrapParenthesizedSemiJoins(whereClause: string): string {
   let normalized = whereClause;
-  let previous: string;
+  let changed = true;
 
-  do {
-    previous = normalized;
-    normalized = normalized.replace(/\(\s*([A-Za-z_][\w.]*\s+(?:NOT\s+)?IN\s*\(\s*SELECT\b[^)]*\))\s*\)/gi, "$1");
-  } while (normalized !== previous);
+  while (changed) {
+    changed = false;
+    const ranges = findParenthesizedRanges(normalized).sort((a, b) => b.start - a.start);
+
+    for (const { start, end } of ranges) {
+      const inner = normalized.slice(start + 1, end);
+      if (!isCompleteSemiJoinExpression(inner)) continue;
+
+      normalized = normalized.slice(0, start) + inner.trim() + normalized.slice(end + 1);
+      changed = true;
+      break;
+    }
+  }
 
   return normalized;
 }
@@ -367,7 +493,7 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
     return { success: false, error: "authToken and baseUrl are required for Salesforce API" };
   }
 
-  const effectiveLimit = Math.min(limit ?? DEFAULT_LIMIT, MAX_LIMIT);
+  const effectiveLimit = normalizeLimit(limit);
   const effectiveMaxBodyLength = maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
 
   try {
@@ -410,8 +536,11 @@ export {
   collectCompleteEmailMessageActivityIds,
   compareTaskEmailRecords,
   getTaskEmailSortKey,
+  normalizeLimit,
   normalizeSubject,
   parseExcludeActivityIds,
+  soqlQuery,
+  validateWhereClause,
 };
 
 export default getCleanActivityRecords;

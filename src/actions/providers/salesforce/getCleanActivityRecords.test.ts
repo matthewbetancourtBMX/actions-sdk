@@ -1,10 +1,24 @@
-import { describe, expect, test } from "@jest/globals";
+import { beforeEach, describe, expect, jest, test } from "@jest/globals";
 import {
   buildEmailMessageActivityIdQuery,
   buildEmailMessageQuery,
   compareTaskEmailRecords,
+  normalizeLimit,
   parseExcludeActivityIds,
+  soqlQuery,
+  validateWhereClause,
 } from "./getCleanActivityRecords.js";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const mockGet = jest.fn<(...args: any[]) => Promise<any>>();
+
+jest.mock("../../util/axiosClient.js", () => ({
+  axiosClient: { get: (...args: any[]) => mockGet(...args) },
+}));
+
+beforeEach(() => {
+  jest.clearAllMocks();
+});
 
 describe("salesforceGetCleanActivityRecords Task email chronology", () => {
   test("orders email Task records by actual sent timestamp before manual sync timestamp", () => {
@@ -63,6 +77,15 @@ describe("salesforceGetCleanActivityRecords EmailMessage exclusions", () => {
     );
   });
 
+  test("unwraps parenthesized semi-joins with nested parentheses inside the subquery", () => {
+    const whereClause =
+      "(Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId IN ('003Qp00000cMnCQIA0', '003Qp00000cMnCQIA1'))) AND MessageDate >= 2026-01-01T00:00:00Z";
+
+    expect(buildEmailMessageQuery(whereClause, 100)).toContain(
+      "FROM EmailMessage WHERE Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId IN ('003Qp00000cMnCQIA0', '003Qp00000cMnCQIA1')) AND MessageDate >= 2026-01-01T00:00:00Z ORDER BY",
+    );
+  });
+
   test("rejects malformed excludeActivityIds JSON", () => {
     expect(() => parseExcludeActivityIds("not-json")).toThrow("excludeActivityIds must be a JSON array string");
   });
@@ -77,5 +100,47 @@ describe("salesforceGetCleanActivityRecords EmailMessage exclusions", () => {
     expect(parseExcludeActivityIds(JSON.stringify(["00T000000000001AAA", "00T000000000001AAA"]))).toEqual([
       "00T000000000001AAA",
     ]);
+  });
+});
+
+describe("salesforceGetCleanActivityRecords input guards", () => {
+  test("rejects unbalanced parentheses that could break appended filters", () => {
+    expect(() => validateWhereClause("1=1) OR (1=1")).toThrow("whereClause contains unbalanced parentheses");
+    expect(() => validateWhereClause("Subject LIKE '%(safe)%' AND WhoId = '003Qp00000cMnCQIA0'")).not.toThrow();
+  });
+
+  test("floors negative and zero limits at one", () => {
+    expect(normalizeLimit(-5)).toBe(1);
+    expect(normalizeLimit(0)).toBe(1);
+    expect(normalizeLimit(200)).toBe(100);
+    expect(normalizeLimit(undefined)).toBe(20);
+  });
+});
+
+describe("salesforceGetCleanActivityRecords Salesforce query pagination", () => {
+  test("follows Salesforce nextRecordsUrl pages", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        data: {
+          records: [{ Id: "02sQp0000000001AAA" }],
+          done: false,
+          nextRecordsUrl: "/services/data/v56.0/query/01gQp0000000001-2000",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          records: [{ Id: "02sQp0000000002AAA" }],
+          done: true,
+        },
+      });
+
+    await expect(
+      soqlQuery("https://example.my.salesforce.com", "token", "SELECT Id FROM EmailMessage"),
+    ).resolves.toEqual([{ Id: "02sQp0000000001AAA" }, { Id: "02sQp0000000002AAA" }]);
+
+    expect(mockGet).toHaveBeenCalledTimes(2);
+    expect(mockGet.mock.calls[1]?.[0]).toBe(
+      "https://example.my.salesforce.com/services/data/v56.0/query/01gQp0000000001-2000",
+    );
   });
 });
