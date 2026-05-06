@@ -246,8 +246,20 @@ function containsSemiJoinSubquery(whereClause: string): boolean {
   return /\b(?:NOT\s+)?IN\s*\(\s*SELECT\b/i.test(whereClause);
 }
 
+function unwrapParenthesizedSemiJoins(whereClause: string): string {
+  let normalized = whereClause;
+  let previous: string;
+
+  do {
+    previous = normalized;
+    normalized = normalized.replace(/\(\s*([A-Za-z_][\w.]*\s+(?:NOT\s+)?IN\s*\(\s*SELECT\b[^)]*\))\s*\)/gi, "$1");
+  } while (normalized !== previous);
+
+  return normalized;
+}
+
 function formatEmailMessageWhereClause(whereClause: string): string {
-  return containsSemiJoinSubquery(whereClause) ? whereClause : `(${whereClause})`;
+  return containsSemiJoinSubquery(whereClause) ? unwrapParenthesizedSemiJoins(whereClause) : `(${whereClause})`;
 }
 
 function buildEmailMessageActivityIdQuery(whereClause: string): string {

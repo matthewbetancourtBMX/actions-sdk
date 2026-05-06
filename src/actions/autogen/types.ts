@@ -6046,7 +6046,7 @@ export const salesforceGetCleanActivityRecordsParamsSchema = z.object({
   whereClause: z
     .string()
     .describe(
-      "SOQL WHERE clause without the WHERE keyword. The agent is responsible for valid SOQL. For Task, TaskSubtype = 'Email' is appended automatically.",
+      "SOQL WHERE clause without the WHERE keyword. The agent is responsible for valid SOQL. For Task, TaskSubtype = 'Email' is appended automatically. For EmailMessage related to a Contact, Lead, User, or other Salesforce record, use a top-level semi-join such as Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003...') AND MessageDate >= 2026-01-01T00:00:00Z. Do not rely only on ToAddress, CcAddress, or BccAddress when a Salesforce record ID is available because recipient fields can miss aliases, changed email addresses, and object relationships.",
     ),
   limit: z
     .number()

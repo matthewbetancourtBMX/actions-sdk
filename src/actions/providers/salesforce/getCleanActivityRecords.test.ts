@@ -54,6 +54,15 @@ describe("salesforceGetCleanActivityRecords EmailMessage exclusions", () => {
     );
   });
 
+  test("unwraps agent-supplied parentheses around EmailMessageRelation semi-joins", () => {
+    const whereClause =
+      "(Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003Qp00000cMnCQIA0')) AND MessageDate >= 2026-01-01T00:00:00Z";
+
+    expect(buildEmailMessageQuery(whereClause, 100)).toContain(
+      "FROM EmailMessage WHERE Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003Qp00000cMnCQIA0') AND MessageDate >= 2026-01-01T00:00:00Z ORDER BY",
+    );
+  });
+
   test("rejects malformed excludeActivityIds JSON", () => {
     expect(() => parseExcludeActivityIds("not-json")).toThrow("excludeActivityIds must be a JSON array string");
   });
