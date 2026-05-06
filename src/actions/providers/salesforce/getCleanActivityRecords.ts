@@ -9,6 +9,7 @@ import { ApiError, axiosClient } from "../../util/axiosClient.js";
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const DEFAULT_MAX_BODY_LENGTH = 500;
+const MAX_ACTIVITY_ID_PAGES = 5;
 // Salesforce IDs are 15 or 18 alphanumeric characters — used to validate excludeActivityIds before SOQL interpolation
 const SF_ID_PATTERN = /^[a-zA-Z0-9]{15,18}$/;
 // Blocks statement terminators and comment sequences that could escape the WHERE clause wrapper
@@ -208,11 +209,14 @@ function validateWhereClause(whereClause: string): void {
   }
 }
 
-async function soqlQuery(baseUrl: string, authToken: string, soql: string): Promise<unknown[]> {
+// maxPages caps pagination for queries without a LIMIT clause (e.g. activity ID collection).
+// Queries with a LIMIT clause never produce more than one page, so the default Infinity is safe for them.
+async function soqlQuery(baseUrl: string, authToken: string, soql: string, maxPages = Infinity): Promise<unknown[]> {
   let url: string | null = `${baseUrl}/services/data/v56.0/query?q=${encodeURIComponent(soql)}`;
   const records: unknown[] = [];
+  let pages = 0;
 
-  while (url) {
+  while (url && pages < maxPages) {
     const response: { data: { records?: unknown[]; done?: boolean; nextRecordsUrl?: string } } = await axiosClient.get(
       url,
       { headers: { Authorization: `Bearer ${authToken}` } },
@@ -222,6 +226,7 @@ async function soqlQuery(baseUrl: string, authToken: string, soql: string): Prom
       response.data.done === false && typeof response.data.nextRecordsUrl === "string"
         ? `${baseUrl}${response.data.nextRecordsUrl}`
         : null;
+    pages++;
   }
 
   return records;
@@ -239,7 +244,8 @@ async function handleTask(
   const exclusionIds = parseExcludeActivityIds(excludeActivityIds);
   const exclusion = exclusionIds.length > 0 ? ` AND Id NOT IN (${exclusionIds.map(id => `'${id}'`).join(",")})` : "";
   // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
-  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, groove_email_sent_at__c, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY groove_email_sent_at__c DESC NULLS LAST, LastModifiedDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  // groove_email_sent_at__c omitted: it only exists in Groove CRM orgs; non-Groove orgs fail with "No such column"
+  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY LastModifiedDate DESC NULLS LAST LIMIT ${limit + 1}`;
   const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
   const hasMore = rawRecords.length > limit;
   const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;
@@ -401,7 +407,12 @@ async function collectCompleteEmailMessageActivityIds(
   authToken: string,
   whereClause: string,
 ): Promise<string[]> {
-  const rows = (await soqlQuery(baseUrl, authToken, buildEmailMessageActivityIdQuery(whereClause))) as SfRecord[];
+  const rows = (await soqlQuery(
+    baseUrl,
+    authToken,
+    buildEmailMessageActivityIdQuery(whereClause),
+    MAX_ACTIVITY_ID_PAGES,
+  )) as SfRecord[];
   return [
     ...new Set(rows.map(row => row.ActivityId).filter((id): id is string => typeof id === "string" && id.length > 0)),
   ];
