@@ -13013,7 +13013,7 @@ export const salesforceGetReportMetadataDefinition: ActionTemplate = {
     };
 export const salesforceGetCleanActivityRecordsDefinition: ActionTemplate = {
         "displayName": "Get clean activity records",
-        "description": "Retrieve Salesforce activity records (Task, EmailMessage, or Event) with email content cleaned of HTML markup, quoted reply chains, and signature blocks. Task and EmailMessage records are deduplicated into threads, reducing token usage by up to 96% compared to raw records. For Task, queries are automatically scoped to TaskSubtype = 'Email'.\n",
+        "description": "Retrieve Salesforce activity records (Task or EmailMessage) with email content cleaned of HTML markup, quoted reply chains, and signature blocks. Task and EmailMessage records are deduplicated into threads, reducing token usage by up to 96% compared to raw records. For Task, queries are automatically scoped to TaskSubtype = 'Email'.\n",
         "scopes": [],
         "tags": [],
         "parameters": {
