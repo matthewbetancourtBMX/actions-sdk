@@ -67,6 +67,20 @@ function hasBalancedParentheses(value: string): boolean {
   return balanced && depth === 0;
 }
 
+function hasDisallowedSoqlSequenceOutsideString(value: string): boolean {
+  let hasDisallowedSequence = false;
+
+  forEachSoqlCharacterOutsideString(value, (_, index) => {
+    if (SOQL_INJECTION_PATTERN.test(value.slice(index, index + 2))) {
+      hasDisallowedSequence = true;
+      return "stop";
+    }
+    return undefined;
+  });
+
+  return hasDisallowedSequence;
+}
+
 function normalizeLimit(limit: number | undefined): number {
   return Math.min(Math.max(1, Math.trunc(limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
 }
@@ -195,7 +209,7 @@ function parseExcludeActivityIds(excludeActivityIds?: string): string[] {
 // allow unintended record access. Hallucinated or malformed SOQL that passes this check returns a
 // Salesforce API error surfaced to the caller.
 function validateWhereClause(whereClause: string): void {
-  if (SOQL_INJECTION_PATTERN.test(whereClause)) {
+  if (hasDisallowedSoqlSequenceOutsideString(whereClause)) {
     throw new Error(
       "whereClause contains disallowed patterns (;  --  /*  */). Provide a plain SOQL filter expression without statement terminators or comment sequences. " +
         "Example: \"WhatId = '001Qp000003abcDEF' AND ActivityDate >= 2024-01-01\"",

@@ -104,6 +104,18 @@ describe("salesforceGetCleanActivityRecords EmailMessage exclusions", () => {
 });
 
 describe("salesforceGetCleanActivityRecords input guards", () => {
+  test("allows disallowed SOQL guard sequences inside quoted string literals", () => {
+    expect(() =>
+      validateWhereClause("Subject LIKE '%Q2--Q3%' AND Description LIKE '%/* note */%' AND Subject != ';'"),
+    ).not.toThrow();
+  });
+
+  test("rejects disallowed SOQL guard sequences outside quoted string literals", () => {
+    expect(() => validateWhereClause("Subject LIKE '%Q2%' -- ignored")).toThrow(
+      "whereClause contains disallowed patterns",
+    );
+  });
+
   test("rejects unbalanced parentheses that could break appended filters", () => {
     expect(() => validateWhereClause("1=1) OR (1=1")).toThrow("whereClause contains unbalanced parentheses");
     expect(() => validateWhereClause("Subject LIKE '%(safe)%' AND WhoId = '003Qp00000cMnCQIA0'")).not.toThrow();
