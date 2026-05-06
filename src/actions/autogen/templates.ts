@@ -11466,6 +11466,100 @@ export const salesforceGetReportMetadataDefinition: ActionTemplate = {
   name: "getReportMetadata",
   provider: "salesforce",
 };
+export const salesforceGetCleanActivityRecordsDefinition: ActionTemplate = {
+  displayName: "Get clean activity records",
+  description:
+    "Retrieve Salesforce activity records (Task or EmailMessage) with email content cleaned of HTML markup, quoted reply chains, and signature blocks. Task and EmailMessage records are deduplicated into threads, reducing token usage by up to 96% compared to raw records. For Task, queries are automatically scoped to TaskSubtype = 'Email' and sorted by the actual email-sent timestamp before Salesforce sync timestamps, because manually synced emails can be synced long after they were sent.\n",
+  scopes: [],
+  tags: [],
+  parameters: {
+    type: "object",
+    required: ["objectType", "whereClause"],
+    properties: {
+      objectType: {
+        type: "string",
+        enum: ["Task", "EmailMessage"],
+        description: "The Salesforce activity object to query: Task or EmailMessage",
+      },
+      whereClause: {
+        type: "string",
+        description:
+          "SOQL WHERE clause without the WHERE keyword. The agent is responsible for valid SOQL. For Task, TaskSubtype = 'Email' is appended automatically. For EmailMessage related to a Contact, Lead, User, or other Salesforce record, use a top-level semi-join such as Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003...') AND MessageDate >= 2026-01-01T00:00:00Z. Do not rely only on ToAddress, CcAddress, or BccAddress when a Salesforce record ID is available because recipient fields can miss aliases, changed email addresses, and object relationships.",
+      },
+      limit: {
+        type: "number",
+        description:
+          "Maximum number of raw records to fetch from Salesforce before deduplication. Defaults to 20, hard-capped at 100.",
+      },
+      maxBodyLength: {
+        type: "number",
+        description:
+          "Maximum characters to return for each thread's cleaned body (cleanedDescription or cleanedBody). Defaults to 500. Increase if the agent needs fuller context on a specific thread.",
+      },
+      returnActivityIds: {
+        type: "boolean",
+        description:
+          "EmailMessage only — when true, performs a separate ActivityId-only query using the same whereClause and returns a complete activityIds string (JSON array) of Task IDs auto-generated alongside matching EmailMessage records. Pass this string directly as excludeActivityIds in a subsequent Task query to avoid returning the same communications twice.",
+      },
+      excludeActivityIds: {
+        type: "string",
+        description:
+          "Task only — JSON array string of Task IDs to exclude from results. Pass the activityIds string returned from a preceding EmailMessage query exactly as provided — no parsing required.",
+      },
+    },
+  },
+  output: {
+    type: "object",
+    required: ["success"],
+    properties: {
+      success: {
+        type: "boolean",
+        description: "Whether the records were successfully retrieved",
+      },
+      objectType: {
+        type: "string",
+        description: "The object type that was queried",
+      },
+      totalFetched: {
+        type: "number",
+        description: "Number of raw records returned from Salesforce",
+      },
+      totalThreads: {
+        type: "number",
+        description: "Number of deduplicated threads",
+      },
+      threads: {
+        type: "array",
+        description: "Deduplicated email threads",
+        items: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+      activityIds: {
+        type: "string",
+        description:
+          "EmailMessage only, returnActivityIds=true — complete JSON array string of Task IDs auto-generated alongside matching EmailMessage records. This list is not capped by the body result limit.",
+      },
+      hasMore: {
+        type: "boolean",
+        description:
+          "True when the number of raw records returned equaled the limit, indicating additional records may exist beyond what was fetched.",
+      },
+      hasMoreMessage: {
+        type: "string",
+        description:
+          "Human-readable message explaining that the result was capped and advising the agent to narrow the WHERE clause or increase the limit.",
+      },
+      error: {
+        type: "string",
+        description: "The error that occurred if the records were not successfully retrieved",
+      },
+    },
+  },
+  name: "getCleanActivityRecords",
+  provider: "salesforce",
+};
 export const microsoftCreateDocumentDefinition: ActionTemplate = {
   displayName: "Create a document",
   description: "Creates a new Office365 document",
