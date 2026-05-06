@@ -145,6 +145,7 @@ export enum ActionName {
   GETSALESFORCERECORDSBYQUERY = "getSalesforceRecordsByQuery",
   GETRECORD = "getRecord",
   GETREPORTMETADATA = "getReportMetadata",
+  GETCLEANACTIVITYRECORDS = "getCleanActivityRecords",
   CREATEDOCUMENT = "createDocument",
   UPDATEDOCUMENT = "updateDocument",
   MESSAGETEAMSCHAT = "messageTeamsChat",
@@ -6036,6 +6037,77 @@ export type salesforceGetReportMetadataFunction = ActionFunction<
   salesforceGetReportMetadataParamsType,
   AuthParamsType,
   salesforceGetReportMetadataOutputType
+>;
+
+export const salesforceGetCleanActivityRecordsParamsSchema = z.object({
+  objectType: z
+    .enum(["Task", "EmailMessage"])
+    .describe("The Salesforce activity object to query: Task or EmailMessage"),
+  whereClause: z
+    .string()
+    .describe(
+      "SOQL WHERE clause without the WHERE keyword. The agent is responsible for valid SOQL. For Task, TaskSubtype = 'Email' is appended automatically. For EmailMessage related to a Contact, Lead, User, or other Salesforce record, use a top-level semi-join such as Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003...') AND MessageDate >= 2026-01-01T00:00:00Z. Do not rely only on ToAddress, CcAddress, or BccAddress when a Salesforce record ID is available because recipient fields can miss aliases, changed email addresses, and object relationships.",
+    ),
+  limit: z
+    .number()
+    .describe(
+      "Maximum number of raw records to fetch from Salesforce before deduplication. Defaults to 20, hard-capped at 100.",
+    )
+    .optional(),
+  maxBodyLength: z
+    .number()
+    .describe(
+      "Maximum characters to return for each thread's cleaned body (cleanedDescription or cleanedBody). Defaults to 500. Increase if the agent needs fuller context on a specific thread.",
+    )
+    .optional(),
+  returnActivityIds: z
+    .boolean()
+    .describe(
+      "EmailMessage only — when true, performs a separate ActivityId-only query using the same whereClause and returns a complete activityIds string (JSON array) of Task IDs auto-generated alongside matching EmailMessage records. Pass this string directly as excludeActivityIds in a subsequent Task query to avoid returning the same communications twice.",
+    )
+    .optional(),
+  excludeActivityIds: z
+    .string()
+    .describe(
+      "Task only — JSON array string of Task IDs to exclude from results. Pass the activityIds string returned from a preceding EmailMessage query exactly as provided — no parsing required.",
+    )
+    .optional(),
+});
+
+export type salesforceGetCleanActivityRecordsParamsType = z.infer<typeof salesforceGetCleanActivityRecordsParamsSchema>;
+
+export const salesforceGetCleanActivityRecordsOutputSchema = z.object({
+  success: z.boolean().describe("Whether the records were successfully retrieved"),
+  objectType: z.string().describe("The object type that was queried").optional(),
+  totalFetched: z.number().describe("Number of raw records returned from Salesforce").optional(),
+  totalThreads: z.number().describe("Number of deduplicated threads").optional(),
+  threads: z.array(z.object({}).catchall(z.any())).describe("Deduplicated email threads").optional(),
+  activityIds: z
+    .string()
+    .describe(
+      "EmailMessage only, returnActivityIds=true — complete JSON array string of Task IDs auto-generated alongside matching EmailMessage records. This list is not capped by the body result limit.",
+    )
+    .optional(),
+  hasMore: z
+    .boolean()
+    .describe(
+      "True when the number of raw records returned equaled the limit, indicating additional records may exist beyond what was fetched.",
+    )
+    .optional(),
+  hasMoreMessage: z
+    .string()
+    .describe(
+      "Human-readable message explaining that the result was capped and advising the agent to narrow the WHERE clause or increase the limit.",
+    )
+    .optional(),
+  error: z.string().describe("The error that occurred if the records were not successfully retrieved").optional(),
+});
+
+export type salesforceGetCleanActivityRecordsOutputType = z.infer<typeof salesforceGetCleanActivityRecordsOutputSchema>;
+export type salesforceGetCleanActivityRecordsFunction = ActionFunction<
+  salesforceGetCleanActivityRecordsParamsType,
+  AuthParamsType,
+  salesforceGetCleanActivityRecordsOutputType
 >;
 
 export const microsoftCreateDocumentParamsSchema = z.object({
