@@ -12,6 +12,7 @@ const DEFAULT_MAX_BODY_LENGTH = 500;
 const MAX_ACTIVITY_ID_PAGES = 5;
 // Salesforce IDs are 15 or 18 alphanumeric characters — used to validate excludeActivityIds before SOQL interpolation
 const SF_ID_PATTERN = /^[a-zA-Z0-9]{15,18}$/;
+const TASK_FIELD_API_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // Blocks statement terminators and comment sequences that could escape the WHERE clause wrapper
 const SOQL_INJECTION_PATTERN = /;|--|\/\*|\*\//;
 
@@ -130,8 +131,31 @@ function parseSalesforceTimestamp(value: unknown): number {
   return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
 }
 
-function getTaskEmailSortKey(record: SfRecord): number {
-  const candidates = [record.ActivityDate, record.CompletedDateTime, record.LastModifiedDate, record.CreatedDate];
+function compareTaskDateCandidates(a: SfRecord, b: SfRecord, taskDateTimeTieBreakerField?: string): number {
+  const candidates = [
+    "ActivityDate",
+    taskDateTimeTieBreakerField,
+    "CompletedDateTime",
+    "LastModifiedDate",
+    "CreatedDate",
+  ].filter((field): field is string => typeof field === "string" && field.length > 0);
+
+  for (const field of candidates) {
+    const byField = parseSalesforceTimestamp(b[field]) - parseSalesforceTimestamp(a[field]);
+    if (byField !== 0) return byField;
+  }
+
+  return 0;
+}
+
+function getTaskEmailSortKey(record: SfRecord, taskDateTimeTieBreakerField?: string): number {
+  const candidates = [
+    taskDateTimeTieBreakerField ? record[taskDateTimeTieBreakerField] : undefined,
+    record.ActivityDate,
+    record.CompletedDateTime,
+    record.LastModifiedDate,
+    record.CreatedDate,
+  ];
 
   for (const candidate of candidates) {
     const parsed = parseSalesforceTimestamp(candidate);
@@ -141,14 +165,20 @@ function getTaskEmailSortKey(record: SfRecord): number {
   return Number.NEGATIVE_INFINITY;
 }
 
-function compareTaskEmailRecords(a: SfRecord, b: SfRecord): number {
-  const byEmailTime = getTaskEmailSortKey(b) - getTaskEmailSortKey(a);
+function compareTaskEmailRecords(a: SfRecord, b: SfRecord, taskDateTimeTieBreakerField?: string): number {
+  const byEmailTime = compareTaskDateCandidates(a, b, taskDateTimeTieBreakerField);
   if (byEmailTime !== 0) return byEmailTime;
   return String(b.Id ?? "").localeCompare(String(a.Id ?? ""));
 }
 
-function formatTaskEmailDate(record: SfRecord): string | null {
-  const candidates = [record.ActivityDate, record.CompletedDateTime, record.LastModifiedDate, record.CreatedDate];
+function formatTaskEmailDate(record: SfRecord, taskDateTimeTieBreakerField?: string): string | null {
+  const candidates = [
+    taskDateTimeTieBreakerField ? record[taskDateTimeTieBreakerField] : undefined,
+    record.ActivityDate,
+    record.CompletedDateTime,
+    record.LastModifiedDate,
+    record.CreatedDate,
+  ];
   return (candidates.find(value => typeof value === "string" && value.length > 0) as string | undefined) ?? null;
 }
 
@@ -188,6 +218,29 @@ function parseExcludeActivityIds(excludeActivityIds?: string): string[] {
   }
 
   return [...new Set(parsed as string[])];
+}
+
+async function validateTaskDateTimeTieBreakerField(
+  baseUrl: string,
+  authToken: string,
+  fieldName?: string,
+): Promise<string | undefined> {
+  if (!fieldName) return undefined;
+  if (!TASK_FIELD_API_NAME_PATTERN.test(fieldName)) {
+    throw new Error("taskDateTimeTieBreakerField must be a valid Task field API name");
+  }
+
+  const fieldRows = await soqlQuery(
+    baseUrl,
+    authToken,
+    `SELECT QualifiedApiName, DataType FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = 'Task' AND QualifiedApiName = '${fieldName}' LIMIT 1`,
+  );
+  const field = fieldRows[0];
+  if (!field || field.DataType !== "Date/Time") {
+    throw new Error("taskDateTimeTieBreakerField must reference a Task Date/Time field");
+  }
+
+  return fieldName;
 }
 
 // whereClause is provided by an AI agent and is NOT treated as untrusted end-user input. This guard
@@ -239,12 +292,38 @@ async function handleTask(
   limit: number,
   maxBodyLength: number,
   excludeActivityIds?: string,
+  taskDateTimeTieBreakerField?: string,
 ): Promise<salesforceGetCleanActivityRecordsOutputType> {
   validateWhereClause(whereClause);
   const exclusionIds = parseExcludeActivityIds(excludeActivityIds);
   const exclusion = exclusionIds.length > 0 ? ` AND Id NOT IN (${exclusionIds.map(id => `'${id}'`).join(",")})` : "";
+  const selectFields = [
+    "Id",
+    "Subject",
+    "TaskSubtype",
+    "ActivityDate",
+    taskDateTimeTieBreakerField,
+    "CompletedDateTime",
+    "CreatedDate",
+    "LastModifiedDate",
+    "Owner.Name",
+    "Owner.Email",
+    "WhoId",
+    "WhatId",
+    "Description",
+  ].filter((field): field is string => typeof field === "string" && field.length > 0);
+  const orderByFields = [
+    "ActivityDate DESC NULLS LAST",
+    taskDateTimeTieBreakerField ? `${taskDateTimeTieBreakerField} DESC NULLS LAST` : undefined,
+    "CompletedDateTime DESC NULLS LAST",
+  ].filter((field): field is string => typeof field === "string" && field.length > 0);
+  // Task email processing is optimized for Groove-style synced email Tasks:
+  // Groove writes direction markers into Subject (>>, <<, Bounced: >>) and can expose a true Date/Time
+  // sent field such as groove_email_sent_at__c. Agents should pass that field through
+  // taskDateTimeTieBreakerField when available; otherwise the portable fallback is ActivityDate with
+  // CompletedDateTime as a sync-time tie-breaker.
   // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
-  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CompletedDateTime, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email' AND Status = 'Completed'${exclusion} ORDER BY ActivityDate DESC NULLS LAST, CompletedDateTime DESC NULLS LAST LIMIT ${limit + 1}`;
+  const soql = `SELECT ${selectFields.join(", ")} FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email' AND Status = 'Completed'${exclusion} ORDER BY ${orderByFields.join(", ")} LIMIT ${limit + 1}`;
   const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
   const hasMore = rawRecords.length > limit;
   const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;
@@ -281,13 +360,13 @@ async function handleTask(
 
   const threads = [];
   for (const [, group] of threadMap) {
-    group.sort(compareTaskEmailRecords);
+    group.sort((a, b) => compareTaskEmailRecords(a, b, taskDateTimeTieBreakerField));
     const latest = group[0];
     const ownerEmail: string | null = latest.Owner?.Email ?? null;
     threads.push({
       normalizedSubject: normalizeSubject(latest.Subject ?? ""),
       threadSize: group.length,
-      latestDate: formatTaskEmailDate(latest),
+      latestDate: formatTaskEmailDate(latest, taskDateTimeTieBreakerField),
       activityDate: latest.ActivityDate ?? null,
       direction: detectTaskDirection(latest.Subject ?? "", latest.Description, ownerEmail),
       owner: latest.Owner?.Name ?? null,
@@ -497,7 +576,15 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
   authParams: AuthParamsType;
 }): Promise<salesforceGetCleanActivityRecordsOutputType> => {
   const { authToken, baseUrl } = authParams;
-  const { objectType, whereClause, limit, maxBodyLength, returnActivityIds, excludeActivityIds } = params;
+  const {
+    objectType,
+    whereClause,
+    limit,
+    maxBodyLength,
+    returnActivityIds,
+    excludeActivityIds,
+    taskDateTimeTieBreakerField,
+  } = params;
 
   if (!authToken || !baseUrl) {
     return { success: false, error: "authToken and baseUrl are required for Salesforce API" };
@@ -507,11 +594,20 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
     return { success: false, error: "excludeActivityIds is only supported when objectType is Task" };
   }
 
+  if (objectType === "EmailMessage" && taskDateTimeTieBreakerField) {
+    return { success: false, error: "taskDateTimeTieBreakerField is only supported when objectType is Task" };
+  }
+
   const effectiveLimit = normalizeLimit(limit);
   const effectiveMaxBodyLength = maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
 
   try {
-    if (objectType === "Task")
+    if (objectType === "Task") {
+      const validatedTaskDateTimeTieBreakerField = await validateTaskDateTimeTieBreakerField(
+        baseUrl,
+        authToken,
+        taskDateTimeTieBreakerField,
+      );
       return await handleTask(
         baseUrl,
         authToken,
@@ -519,7 +615,9 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
         effectiveLimit,
         effectiveMaxBodyLength,
         excludeActivityIds,
+        validatedTaskDateTimeTieBreakerField,
       );
+    }
     return await handleEmailMessage(
       baseUrl,
       authToken,

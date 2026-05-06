@@ -21,7 +21,7 @@ jest.mock("../../util/axiosClient.js", () => ({
 }));
 
 beforeEach(() => {
-  jest.clearAllMocks();
+  mockGet.mockReset();
 });
 
 describe("salesforceGetCleanActivityRecords Task email chronology", () => {
@@ -152,6 +152,89 @@ describe("salesforceGetCleanActivityRecords Task filters", () => {
     expect(soql).toContain("CompletedDateTime");
     expect(soql).toContain("ORDER BY ActivityDate DESC NULLS LAST, CompletedDateTime DESC NULLS LAST");
     expect(soql).not.toContain("__c");
+  });
+
+  test("uses an optional Task DateTime tie-breaker field for Groove-style same-day email chronology", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        data: {
+          records: [{ QualifiedApiName: "groove_email_sent_at__c", DataType: "Date/Time" }],
+          done: true,
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          records: [
+            {
+              Id: "00T000000000001AAA",
+              Subject: "Email: >> Re: ButterflyMX Inquiry",
+              ActivityDate: "2026-05-05",
+              CompletedDateTime: "2026-05-05T20:00:00.000+0000",
+              groove_email_sent_at__c: "2026-05-05T10:00:00.000+0000",
+              Description: "From: rep@example.com\nTo: customer@example.com\n\nEarlier reply",
+            },
+            {
+              Id: "00T000000000002AAA",
+              Subject: "Email: >> Re: ButterflyMX Inquiry",
+              ActivityDate: "2026-05-05",
+              CompletedDateTime: "2026-05-05T19:00:00.000+0000",
+              groove_email_sent_at__c: "2026-05-05T15:00:00.000+0000",
+              Description: "From: rep@example.com\nTo: customer@example.com\n\nLater reply",
+            },
+          ],
+          done: true,
+        },
+      });
+
+    const result = await getCleanActivityRecords({
+      params: {
+        objectType: "Task",
+        whereClause: "WhatId = 'a3bQp000001h4J7IAI'",
+        taskDateTimeTieBreakerField: "groove_email_sent_at__c",
+      },
+      authParams: {
+        authToken: "token",
+        baseUrl: "https://example.my.salesforce.com",
+      },
+    });
+
+    const taskRequestUrl = String(mockGet.mock.calls[1]?.[0]);
+    const taskSoql = decodeURIComponent(new URL(taskRequestUrl).searchParams.get("q") ?? "");
+    expect(taskSoql).toContain("groove_email_sent_at__c");
+    expect(taskSoql).toContain(
+      "ORDER BY ActivityDate DESC NULLS LAST, groove_email_sent_at__c DESC NULLS LAST, CompletedDateTime DESC NULLS LAST",
+    );
+    expect(result).toMatchObject({
+      success: true,
+      threads: [{ latestTaskId: "00T000000000002AAA", latestDate: "2026-05-05T15:00:00.000+0000" }],
+    });
+  });
+
+  test("rejects optional Task tie-breaker fields that are not Salesforce DateTime fields", async () => {
+    mockGet.mockResolvedValueOnce({
+      data: {
+        records: [{ QualifiedApiName: "Some_Date__c", DataType: "Date" }],
+        done: true,
+      },
+    });
+
+    await expect(
+      getCleanActivityRecords({
+        params: {
+          objectType: "Task",
+          whereClause: "WhatId = 'a3bQp000001h4J7IAI'",
+          taskDateTimeTieBreakerField: "Some_Date__c",
+        },
+        authParams: {
+          authToken: "token",
+          baseUrl: "https://example.my.salesforce.com",
+        },
+      }),
+    ).resolves.toMatchObject({
+      success: false,
+      error: "taskDateTimeTieBreakerField must reference a Task Date/Time field",
+    });
+    expect(mockGet).toHaveBeenCalledTimes(1);
   });
 });
 
