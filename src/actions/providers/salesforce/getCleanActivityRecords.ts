@@ -9,7 +9,7 @@ import { ApiError, axiosClient } from "../../util/axiosClient.js";
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const DEFAULT_MAX_BODY_LENGTH = 500;
-const MAX_ACTIVITY_ID_PAGES = 5;
+const MAX_ACTIVITY_ID_PAGES = 50;
 // Salesforce IDs are 15 or 18 alphanumeric characters — used to validate excludeActivityIds before SOQL interpolation
 const SF_ID_PATTERN = /^[a-zA-Z0-9]{15,18}$/;
 // Blocks statement terminators and comment sequences that could escape the WHERE clause wrapper
@@ -18,18 +18,75 @@ const SOQL_INJECTION_PATTERN = /;|--|\/\*|\*\//;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type SfRecord = Record<string, any>;
 
+function forEachSoqlCharacterOutsideString(
+  value: string,
+  callback: (character: string, index: number) => void | "stop",
+): void {
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < value.length; i += 1) {
+    const character = value[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === "'" && value[i + 1] === "'") {
+        i += 1;
+      } else if (character === "'") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (character === "'") {
+      inString = true;
+      continue;
+    }
+
+    if (callback(character, i) === "stop") return;
+  }
+}
+
+function hasBalancedParentheses(value: string): boolean {
+  let depth = 0;
+  let balanced = true;
+
+  forEachSoqlCharacterOutsideString(value, character => {
+    if (character === "(") depth += 1;
+    if (character === ")") depth -= 1;
+    if (depth < 0) {
+      balanced = false;
+      return "stop";
+    }
+    return undefined;
+  });
+
+  return balanced && depth === 0;
+}
+
+function normalizeLimit(limit: number | undefined): number {
+  return Math.min(Math.max(1, Math.trunc(limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&#?\\w+;/g, "");
+}
+
 function cleanBody(text: string | null | undefined): string | null {
   if (!text) return null;
   let s = text;
   s = s.replace(/\r\n/g, "\n");
+  s = decodeHtmlEntities(s);
   s = s.replace(/<([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>/g, "[$1]");
   s = s.replace(/<[^>]+>/g, " ");
-  s = s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&#?\w+;/g, "");
   s = s.replace(/^(From|To|CC|BCC|Date|Subject|Attachment):.*\n/gim, "");
   const qm = s.match(/(?:^|\n)(On [\s\S]{0,250}?wrote:\s*(?:\n|$))/);
   if (qm && qm.index !== undefined) {
@@ -38,6 +95,21 @@ function cleanBody(text: string | null | undefined): string | null {
   }
   s = s.replace(/\n--\s*\n[\s\S]*$/, "");
   s = s.replace(/\n{3,}/g, "\n\n").trim();
+  return s.length > 0 ? s : null;
+}
+
+function normalizeEmailHeaderText(text: string | null | undefined): string | null {
+  if (!text) return null;
+
+  let s = text.replace(/\r\n/g, "\n");
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<\/(?:div|p|li|tr|h[1-6])>/gi, "\n");
+  s = decodeHtmlEntities(s);
+  s = s.replace(/<([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>/g, "[$1]");
+  s = s.replace(/<[^>]+>/g, " ");
+  s = s.replace(/[ \t]+/g, " ");
+  s = s.replace(/\n\s+/g, "\n").trim();
+
   return s.length > 0 ? s : null;
 }
 
@@ -65,7 +137,6 @@ function parseSalesforceTimestamp(value: unknown): number {
 
 function getTaskEmailSortKey(record: SfRecord): number {
   const candidates = [
-    record.groove_email_sent_at__c,
     record.Email_Sent_At__c,
     record.EmailDate__c,
     record.LastModifiedDate,
@@ -89,7 +160,6 @@ function compareTaskEmailRecords(a: SfRecord, b: SfRecord): number {
 
 function formatTaskEmailDate(record: SfRecord): string | null {
   const candidates = [
-    record.groove_email_sent_at__c,
     record.Email_Sent_At__c,
     record.EmailDate__c,
     record.LastModifiedDate,
@@ -107,9 +177,13 @@ function detectTaskDirection(
   if (subject.includes(">>")) return "outbound";
   if (subject.includes("<<") || /\[inbox\]/i.test(subject)) return "inbound";
   if (description && ownerEmail) {
-    const fromMatch = description.match(/^From:\s*.+?<([^>]+)>/m) || description.match(/^From:\s*(\S+@\S+)/m);
+    const fromMatch =
+      description.match(/^From:\s*.*?\[([^\]]+@[^\]]+)\]/im) ||
+      description.match(/^From:\s*.*?<([^>]+)>/im) ||
+      description.match(/^From:\s*(\S+@\S+)/im);
     if (fromMatch) {
-      return fromMatch[1].toLowerCase() === ownerEmail.toLowerCase() ? "outbound" : "inbound";
+      const fromEmail = fromMatch[1].trim().replace(/[>,;]+$/, "").toLowerCase();
+      return fromEmail === ownerEmail.toLowerCase() ? "outbound" : "inbound";
     }
   }
   return "unknown";
@@ -148,6 +222,12 @@ function validateWhereClause(whereClause: string): void {
         "Example: \"WhatId = '001Qp000003abcDEF' AND ActivityDate >= 2024-01-01\"",
     );
   }
+  if (!hasBalancedParentheses(whereClause)) {
+    throw new Error(
+      "whereClause contains unbalanced parentheses. Provide a balanced SOQL filter expression that cannot escape appended safety filters. " +
+        "Example: \"(WhatId = '001Qp000003abcDEF' OR WhoId = '003Qp000003abcDEF') AND ActivityDate >= 2024-01-01\"",
+    );
+  }
 }
 
 async function soqlQuery(baseUrl: string, authToken: string, soql: string): Promise<unknown[]> {
@@ -167,9 +247,16 @@ async function soqlQueryAll(baseUrl: string, authToken: string, soql: string, ma
     const data = response.data as { records?: unknown[]; done?: boolean; nextRecordsUrl?: string };
     all.push(...(data.records ?? []));
     url = data.done === false && data.nextRecordsUrl ? `${baseUrl}${data.nextRecordsUrl}` : null;
-    pages++;
+    pages += 1;
   }
   return all;
+}
+
+function buildTaskQuery(whereClause: string, limit: number, exclusionIds: string[] = []): string {
+  const exclusion = exclusionIds.length > 0 ? ` AND Id NOT IN (${exclusionIds.map(id => `'${id}'`).join(",")})` : "";
+  return `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY LastModifiedDate DESC NULLS LAST LIMIT ${
+    limit + 1
+  }`;
 }
 
 async function handleTask(
@@ -182,10 +269,9 @@ async function handleTask(
 ): Promise<salesforceGetCleanActivityRecordsOutputType> {
   validateWhereClause(whereClause);
   const exclusionIds = parseExcludeActivityIds(excludeActivityIds);
-  const exclusion = exclusionIds.length > 0 ? ` AND Id NOT IN (${exclusionIds.map(id => `'${id}'`).join(",")})` : "";
-  // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
-  // groove_email_sent_at__c omitted: it only exists in Groove CRM orgs; non-Groove orgs fail with "No such column"
-  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY LastModifiedDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata.
+  // The Task query intentionally avoids package-specific fields such as groove_email_sent_at__c so the action works in standard Salesforce orgs.
+  const soql = buildTaskQuery(whereClause, limit, exclusionIds);
   const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
   const hasMore = rawRecords.length > limit;
   const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;
@@ -225,19 +311,21 @@ async function handleTask(
     group.sort(compareTaskEmailRecords);
     const latest = group[0];
     const ownerEmail: string | null = latest.Owner?.Email ?? null;
+    const cleanedDescription = cleanBody(latest.Description);
+    const directionDescription = normalizeEmailHeaderText(latest.Description);
     threads.push({
       normalizedSubject: normalizeSubject(latest.Subject ?? ""),
       threadSize: group.length,
       latestDate: formatTaskEmailDate(latest),
       activityDate: latest.ActivityDate ?? null,
-      direction: detectTaskDirection(latest.Subject ?? "", latest.Description, ownerEmail),
+      direction: detectTaskDirection(latest.Subject ?? "", directionDescription, ownerEmail),
       owner: latest.Owner?.Name ?? null,
       whoId: latest.WhoId ?? null,
       whatId: latest.WhatId ?? null,
       contact: latest.WhoId ? (contactMap.get(latest.WhoId) ?? null) : null,
       latestTaskId: latest.Id,
       allTaskIds: group.map(r => r.Id as string),
-      cleanedDescription: truncate(cleanBody(latest.Description), maxBodyLength),
+      cleanedDescription: truncate(cleanedDescription, maxBodyLength),
     });
   }
 
@@ -285,7 +373,9 @@ function buildEmailMessageActivityIdQuery(whereClause: string): string {
 }
 
 function buildEmailMessageQuery(whereClause: string, limit: number): string {
-  return `SELECT Id, Subject, MessageDate, Incoming, FromAddress, ToAddress, CcAddress, TextBody, ThreadIdentifier, MessageIdentifier, RelatedToId, ActivityId FROM EmailMessage WHERE ${formatEmailMessageWhereClause(whereClause)} ORDER BY MessageDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  return `SELECT Id, Subject, MessageDate, Incoming, FromAddress, ToAddress, CcAddress, TextBody, ThreadIdentifier, MessageIdentifier, RelatedToId, ActivityId FROM EmailMessage WHERE ${formatEmailMessageWhereClause(
+    whereClause,
+  )} ORDER BY MessageDate DESC NULLS LAST LIMIT ${limit + 1}`;
 }
 
 async function collectCompleteEmailMessageActivityIds(
@@ -390,7 +480,7 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
     return { success: false, error: "authToken and baseUrl are required for Salesforce API" };
   }
 
-  const effectiveLimit = Math.min(limit ?? DEFAULT_LIMIT, MAX_LIMIT);
+  const effectiveLimit = normalizeLimit(limit);
   const effectiveMaxBodyLength = maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
 
   try {
@@ -429,12 +519,18 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
 export {
   buildEmailMessageActivityIdQuery,
   buildEmailMessageQuery,
+  buildTaskQuery,
   cleanBody,
   collectCompleteEmailMessageActivityIds,
   compareTaskEmailRecords,
+  detectTaskDirection,
   getTaskEmailSortKey,
+  normalizeEmailHeaderText,
+  normalizeLimit,
   normalizeSubject,
   parseExcludeActivityIds,
+  soqlQueryAll,
+  validateWhereClause,
 };
 
 export default getCleanActivityRecords;
