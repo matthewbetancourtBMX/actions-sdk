@@ -1,6 +1,7 @@
 import { describe, expect, test } from "@jest/globals";
 import {
   buildEmailMessageActivityIdQuery,
+  buildEmailMessageQuery,
   compareTaskEmailRecords,
   parseExcludeActivityIds,
 } from "./getCleanActivityRecords.js";
@@ -39,6 +40,18 @@ describe("salesforceGetCleanActivityRecords EmailMessage exclusions", () => {
     );
     expect(soql).not.toContain("LIMIT");
     expect(soql).not.toContain("TextBody");
+  });
+
+  test("keeps EmailMessageRelation semi-joins at the top level when date filters are present", () => {
+    const whereClause =
+      "Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003Qp00000cMnCQIA0') AND MessageDate >= 2026-01-01T00:00:00Z";
+
+    expect(buildEmailMessageQuery(whereClause, 100)).toContain(
+      "FROM EmailMessage WHERE Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003Qp00000cMnCQIA0') AND MessageDate >= 2026-01-01T00:00:00Z ORDER BY",
+    );
+    expect(buildEmailMessageActivityIdQuery(whereClause)).toBe(
+      "SELECT ActivityId FROM EmailMessage WHERE Id IN (SELECT EmailMessageId FROM EmailMessageRelation WHERE RelationId = '003Qp00000cMnCQIA0') AND MessageDate >= 2026-01-01T00:00:00Z AND ActivityId != null",
+    );
   });
 
   test("rejects malformed excludeActivityIds JSON", () => {

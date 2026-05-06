@@ -242,8 +242,20 @@ async function handleTask(
   };
 }
 
+function containsSemiJoinSubquery(whereClause: string): boolean {
+  return /\b(?:NOT\s+)?IN\s*\(\s*SELECT\b/i.test(whereClause);
+}
+
+function formatEmailMessageWhereClause(whereClause: string): string {
+  return containsSemiJoinSubquery(whereClause) ? whereClause : `(${whereClause})`;
+}
+
 function buildEmailMessageActivityIdQuery(whereClause: string): string {
-  return `SELECT ActivityId FROM EmailMessage WHERE (${whereClause}) AND ActivityId != null`;
+  return `SELECT ActivityId FROM EmailMessage WHERE ${formatEmailMessageWhereClause(whereClause)} AND ActivityId != null`;
+}
+
+function buildEmailMessageQuery(whereClause: string, limit: number): string {
+  return `SELECT Id, Subject, MessageDate, Incoming, FromAddress, ToAddress, CcAddress, TextBody, ThreadIdentifier, MessageIdentifier, RelatedToId, ActivityId FROM EmailMessage WHERE ${formatEmailMessageWhereClause(whereClause)} ORDER BY MessageDate DESC NULLS LAST LIMIT ${limit + 1}`;
 }
 
 async function collectCompleteEmailMessageActivityIds(
@@ -267,7 +279,7 @@ async function handleEmailMessage(
 ): Promise<salesforceGetCleanActivityRecordsOutputType> {
   validateWhereClause(whereClause);
   // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
-  const soql = `SELECT Id, Subject, MessageDate, Incoming, FromAddress, ToAddress, CcAddress, TextBody, ThreadIdentifier, MessageIdentifier, RelatedToId, ActivityId FROM EmailMessage WHERE (${whereClause}) ORDER BY MessageDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  const soql = buildEmailMessageQuery(whereClause, limit);
   const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
   const hasMore = rawRecords.length > limit;
   const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;
@@ -381,6 +393,7 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
 
 export {
   buildEmailMessageActivityIdQuery,
+  buildEmailMessageQuery,
   cleanBody,
   collectCompleteEmailMessageActivityIds,
   compareTaskEmailRecords,
