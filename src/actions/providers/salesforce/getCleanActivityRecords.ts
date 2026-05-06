@@ -14,13 +14,21 @@ const SF_ID_PATTERN = /^[a-zA-Z0-9]{15,18}$/;
 // Blocks statement terminators and comment sequences that could escape the WHERE clause wrapper
 const SOQL_INJECTION_PATTERN = /;|--|\/\*|\*\//;
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type SfRecord = Record<string, any>;
+
 function cleanBody(text: string | null | undefined): string | null {
   if (!text) return null;
   let s = text;
   s = s.replace(/\r\n/g, "\n");
-  s = s.replace(/<([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})>/g, "[$1]");
+  s = s.replace(/<([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>/g, "[$1]");
   s = s.replace(/<[^>]+>/g, " ");
-  s = s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/&#?\w+;/g, "");
+  s = s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#?\w+;/g, "");
   s = s.replace(/^(From|To|CC|BCC|Date|Subject|Attachment):.*\n/gim, "");
   const qm = s.match(/(?:^|\n)(On [\s\S]{0,250}?wrote:\s*(?:\n|$))/);
   if (qm && qm.index !== undefined) {
@@ -48,6 +56,48 @@ function normalizeSubject(subject: string): string {
   return s.trim();
 }
 
+function parseSalesforceTimestamp(value: unknown): number {
+  if (typeof value !== "string" || value.length === 0) return Number.NEGATIVE_INFINITY;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+}
+
+function getTaskEmailSortKey(record: SfRecord): number {
+  const candidates = [
+    record.groove_email_sent_at__c,
+    record.Email_Sent_At__c,
+    record.EmailDate__c,
+    record.LastModifiedDate,
+    record.CreatedDate,
+    record.ActivityDate,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = parseSalesforceTimestamp(candidate);
+    if (parsed !== Number.NEGATIVE_INFINITY) return parsed;
+  }
+
+  return Number.NEGATIVE_INFINITY;
+}
+
+function compareTaskEmailRecords(a: SfRecord, b: SfRecord): number {
+  const byEmailTime = getTaskEmailSortKey(b) - getTaskEmailSortKey(a);
+  if (byEmailTime !== 0) return byEmailTime;
+  return String(b.Id ?? "").localeCompare(String(a.Id ?? ""));
+}
+
+function formatTaskEmailDate(record: SfRecord): string | null {
+  const candidates = [
+    record.groove_email_sent_at__c,
+    record.Email_Sent_At__c,
+    record.EmailDate__c,
+    record.LastModifiedDate,
+    record.CreatedDate,
+    record.ActivityDate,
+  ];
+  return (candidates.find(value => typeof value === "string" && value.length > 0) as string | undefined) ?? null;
+}
+
 function detectTaskDirection(
   subject: string,
   description: string | null | undefined,
@@ -56,13 +106,34 @@ function detectTaskDirection(
   if (subject.includes(">>")) return "outbound";
   if (subject.includes("<<") || /\[inbox\]/i.test(subject)) return "inbound";
   if (description && ownerEmail) {
-    const fromMatch =
-      description.match(/^From:\s*.+?<([^>]+)>/m) || description.match(/^From:\s*(\S+@\S+)/m);
+    const fromMatch = description.match(/^From:\s*.+?<([^>]+)>/m) || description.match(/^From:\s*(\S+@\S+)/m);
     if (fromMatch) {
       return fromMatch[1].toLowerCase() === ownerEmail.toLowerCase() ? "outbound" : "inbound";
     }
   }
   return "unknown";
+}
+
+function parseExcludeActivityIds(excludeActivityIds?: string): string[] {
+  if (!excludeActivityIds) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(excludeActivityIds);
+  } catch {
+    throw new Error("excludeActivityIds must be a JSON array string");
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("excludeActivityIds must be a JSON array string");
+  }
+
+  const invalid = parsed.filter(id => typeof id !== "string" || !SF_ID_PATTERN.test(id));
+  if (invalid.length > 0) {
+    throw new Error(`excludeActivityIds contains invalid Salesforce IDs: ${invalid.join(", ")}`);
+  }
+
+  return [...new Set(parsed as string[])];
 }
 
 // whereClause is provided by an AI agent and is NOT treated as untrusted end-user input. This guard
@@ -84,9 +155,6 @@ async function soqlQuery(baseUrl: string, authToken: string, soql: string): Prom
   return response.data.records ?? [];
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type SfRecord = Record<string, any>;
-
 async function handleTask(
   baseUrl: string,
   authToken: string,
@@ -96,14 +164,10 @@ async function handleTask(
   excludeActivityIds?: string,
 ): Promise<salesforceGetCleanActivityRecordsOutputType> {
   validateWhereClause(whereClause);
-  const parsedExclusions: string[] = excludeActivityIds ? (JSON.parse(excludeActivityIds) as string[]) : [];
-  const safeExclusions = parsedExclusions.filter(id => SF_ID_PATTERN.test(id));
-  const exclusion =
-    safeExclusions.length > 0
-      ? ` AND Id NOT IN (${safeExclusions.map(id => `'${id}'`).join(",")})`
-      : "";
+  const exclusionIds = parseExcludeActivityIds(excludeActivityIds);
+  const exclusion = exclusionIds.length > 0 ? ` AND Id NOT IN (${exclusionIds.map(id => `'${id}'`).join(",")})` : "";
   // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
-  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY ActivityDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, CreatedDate, LastModifiedDate, groove_email_sent_at__c, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY groove_email_sent_at__c DESC NULLS LAST, LastModifiedDate DESC NULLS LAST LIMIT ${limit + 1}`;
   const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
   const hasMore = rawRecords.length > limit;
   const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;
@@ -140,17 +204,14 @@ async function handleTask(
 
   const threads = [];
   for (const [, group] of threadMap) {
-    group.sort((a, b) => {
-      if (!a.ActivityDate) return 1;
-      if (!b.ActivityDate) return -1;
-      return b.ActivityDate.localeCompare(a.ActivityDate);
-    });
+    group.sort(compareTaskEmailRecords);
     const latest = group[0];
     const ownerEmail: string | null = latest.Owner?.Email ?? null;
     threads.push({
       normalizedSubject: normalizeSubject(latest.Subject ?? ""),
       threadSize: group.length,
-      latestDate: latest.ActivityDate ?? null,
+      latestDate: formatTaskEmailDate(latest),
+      activityDate: latest.ActivityDate ?? null,
       direction: detectTaskDirection(latest.Subject ?? "", latest.Description, ownerEmail),
       owner: latest.Owner?.Name ?? null,
       whoId: latest.WhoId ?? null,
@@ -179,6 +240,21 @@ async function handleTask(
       hasMoreMessage: `Result set was capped at ${limit} records (${threads.length} threads shown). There may be additional Task activity not included in this response. Narrow your WHERE clause or increase the limit parameter to retrieve more.`,
     }),
   };
+}
+
+function buildEmailMessageActivityIdQuery(whereClause: string): string {
+  return `SELECT ActivityId FROM EmailMessage WHERE (${whereClause}) AND ActivityId != null`;
+}
+
+async function collectCompleteEmailMessageActivityIds(
+  baseUrl: string,
+  authToken: string,
+  whereClause: string,
+): Promise<string[]> {
+  const rows = (await soqlQuery(baseUrl, authToken, buildEmailMessageActivityIdQuery(whereClause))) as SfRecord[];
+  return [
+    ...new Set(rows.map(row => row.ActivityId).filter((id): id is string => typeof id === "string" && id.length > 0)),
+  ];
 }
 
 async function handleEmailMessage(
@@ -247,7 +323,7 @@ async function handleEmailMessage(
   };
 
   if (returnActivityIds) {
-    result.activityIds = JSON.stringify(records.map(r => r.ActivityId as string).filter(Boolean));
+    result.activityIds = JSON.stringify(await collectCompleteEmailMessageActivityIds(baseUrl, authToken, whereClause));
   }
 
   return result;
@@ -271,8 +347,23 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
   const effectiveMaxBodyLength = maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
 
   try {
-    if (objectType === "Task") return await handleTask(baseUrl, authToken, whereClause, effectiveLimit, effectiveMaxBodyLength, excludeActivityIds);
-    return await handleEmailMessage(baseUrl, authToken, whereClause, effectiveLimit, effectiveMaxBodyLength, returnActivityIds);
+    if (objectType === "Task")
+      return await handleTask(
+        baseUrl,
+        authToken,
+        whereClause,
+        effectiveLimit,
+        effectiveMaxBodyLength,
+        excludeActivityIds,
+      );
+    return await handleEmailMessage(
+      baseUrl,
+      authToken,
+      whereClause,
+      effectiveLimit,
+      effectiveMaxBodyLength,
+      returnActivityIds,
+    );
   } catch (error) {
     return {
       success: false,
@@ -286,6 +377,16 @@ const getCleanActivityRecords: salesforceGetCleanActivityRecordsFunction = async
             : "An unknown error occurred",
     };
   }
+};
+
+export {
+  buildEmailMessageActivityIdQuery,
+  cleanBody,
+  collectCompleteEmailMessageActivityIds,
+  compareTaskEmailRecords,
+  getTaskEmailSortKey,
+  normalizeSubject,
+  parseExcludeActivityIds,
 };
 
 export default getCleanActivityRecords;
