@@ -168,7 +168,9 @@ When `objectType = 'EmailMessage'`, records are grouped into threads using the n
 
 - Auth pattern: `Authorization: Bearer <authToken>` via `axiosClient.ts` — matches all existing Salesforce actions
 - REST endpoint: `GET /services/data/v56.0/query?q=<encoded SOQL>`
-- The action does not validate the WHERE clause — malformed SOQL returns a Salesforce API error that is surfaced to the caller
+- `whereClause` is validated before execution: statement terminators (`;`) and comment sequences (`--`, `/*`, `*/`) are rejected with a descriptive error the agent can act on. This prevents those patterns from escaping the `WHERE (${whereClause}) AND ...` wrapper and accessing unintended records. Keywords like `AND`, `OR`, `IN`, `NOT IN`, `LIKE` are allowed; `SELECT`, `UNION`, and DML keywords are not valid in a SOQL WHERE clause and would produce a Salesforce API error if injected. Trust model: callers are AI agents operating in a trusted pipeline, not untrusted end users.
+- `excludeActivityIds` values are validated against the Salesforce ID format (`/^[a-zA-Z0-9]{15,18}$/`) before SOQL interpolation; entries that do not match are silently dropped.
+- `hasMore` detection uses a `LIMIT + 1` fetch: the action requests one extra record and checks whether it was returned. This avoids reliance on Salesforce query metadata (`done` / `nextRecordsUrl`), which behaves inconsistently when a `LIMIT` clause is present. Malformed SOQL that passes the injection check returns a Salesforce API error that is surfaced to the caller.
 - Registered as `type: 'read'` in `actionMapper.ts`
 - Schema defined in `schema.yaml`, types regenerated via `npm run generate:types`
 - Implementation at `src/actions/providers/salesforce/getCleanActivityRecords.ts`

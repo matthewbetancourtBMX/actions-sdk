@@ -9,6 +9,10 @@ import { ApiError, axiosClient } from "../../util/axiosClient.js";
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const DEFAULT_MAX_BODY_LENGTH = 500;
+// Salesforce IDs are 15 or 18 alphanumeric characters — used to validate excludeActivityIds before SOQL interpolation
+const SF_ID_PATTERN = /^[a-zA-Z0-9]{15,18}$/;
+// Blocks statement terminators and comment sequences that could escape the WHERE clause wrapper
+const SOQL_INJECTION_PATTERN = /;|--|\/\*|\*\//;
 
 function cleanBody(text: string | null | undefined): string | null {
   if (!text) return null;
@@ -61,6 +65,19 @@ function detectTaskDirection(
   return "unknown";
 }
 
+// whereClause is provided by an AI agent and is NOT treated as untrusted end-user input. This guard
+// blocks comment sequences and statement terminators that could break the WHERE clause wrapping and
+// allow unintended record access. Hallucinated or malformed SOQL that passes this check returns a
+// Salesforce API error surfaced to the caller.
+function validateWhereClause(whereClause: string): void {
+  if (SOQL_INJECTION_PATTERN.test(whereClause)) {
+    throw new Error(
+      "whereClause contains disallowed patterns (;  --  /*  */). Provide a plain SOQL filter expression without statement terminators or comment sequences. " +
+        "Example: \"WhatId = '001Qp000003abcDEF' AND ActivityDate >= 2024-01-01\"",
+    );
+  }
+}
+
 async function soqlQuery(baseUrl: string, authToken: string, soql: string): Promise<unknown[]> {
   const url = `${baseUrl}/services/data/v56.0/query?q=${encodeURIComponent(soql)}`;
   const response = await axiosClient.get(url, { headers: { Authorization: `Bearer ${authToken}` } });
@@ -78,13 +95,18 @@ async function handleTask(
   maxBodyLength: number,
   excludeActivityIds?: string,
 ): Promise<salesforceGetCleanActivityRecordsOutputType> {
+  validateWhereClause(whereClause);
   const parsedExclusions: string[] = excludeActivityIds ? (JSON.parse(excludeActivityIds) as string[]) : [];
+  const safeExclusions = parsedExclusions.filter(id => SF_ID_PATTERN.test(id));
   const exclusion =
-    parsedExclusions.length > 0
-      ? ` AND Id NOT IN (${parsedExclusions.map(id => `'${id}'`).join(",")})`
+    safeExclusions.length > 0
+      ? ` AND Id NOT IN (${safeExclusions.map(id => `'${id}'`).join(",")})`
       : "";
-  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY ActivityDate DESC NULLS LAST LIMIT ${limit}`;
-  const records = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
+  // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
+  const soql = `SELECT Id, Subject, TaskSubtype, ActivityDate, Owner.Name, Owner.Email, WhoId, WhatId, Description FROM Task WHERE (${whereClause}) AND TaskSubtype = 'Email'${exclusion} ORDER BY ActivityDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
+  const hasMore = rawRecords.length > limit;
+  const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;
 
   // Group by normalizedSubject + WhoId + WhatId
   const threadMap = new Map<string, SfRecord[]>();
@@ -146,7 +168,6 @@ async function handleTask(
     return b.latestDate.localeCompare(a.latestDate);
   });
 
-  const hasMore = records.length >= limit;
   return {
     success: true,
     objectType: "Task",
@@ -168,8 +189,12 @@ async function handleEmailMessage(
   maxBodyLength: number,
   returnActivityIds?: boolean,
 ): Promise<salesforceGetCleanActivityRecordsOutputType> {
-  const soql = `SELECT Id, Subject, MessageDate, Incoming, FromAddress, ToAddress, CcAddress, TextBody, ThreadIdentifier, MessageIdentifier, RelatedToId, ActivityId FROM EmailMessage WHERE (${whereClause}) ORDER BY MessageDate DESC NULLS LAST LIMIT ${limit}`;
-  const records = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
+  validateWhereClause(whereClause);
+  // Fetch limit+1 to determine whether additional records exist without relying on Salesforce pagination metadata
+  const soql = `SELECT Id, Subject, MessageDate, Incoming, FromAddress, ToAddress, CcAddress, TextBody, ThreadIdentifier, MessageIdentifier, RelatedToId, ActivityId FROM EmailMessage WHERE (${whereClause}) ORDER BY MessageDate DESC NULLS LAST LIMIT ${limit + 1}`;
+  const rawRecords = (await soqlQuery(baseUrl, authToken, soql)) as SfRecord[];
+  const hasMore = rawRecords.length > limit;
+  const records = hasMore ? rawRecords.slice(0, limit) : rawRecords;
 
   const threadMap = new Map<string, SfRecord[]>();
   for (const r of records) {
@@ -209,7 +234,6 @@ async function handleEmailMessage(
     return b.latestDate.localeCompare(a.latestDate);
   });
 
-  const hasMore = records.length >= limit;
   const result: salesforceGetCleanActivityRecordsOutputType = {
     success: true,
     objectType: "EmailMessage",
